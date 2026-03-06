@@ -27,6 +27,20 @@ func containsCJK(s string) bool {
 	return false
 }
 
+// cjkRuneCount returns count of CJK runes in a string.
+func cjkRuneCount(s string) int {
+	count := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) ||
+			unicode.Is(unicode.Hiragana, r) ||
+			unicode.Is(unicode.Katakana, r) ||
+			unicode.Is(unicode.Hangul, r) {
+			count++
+		}
+	}
+	return count
+}
+
 var (
 	searchTag       []string
 	searchLimit     int
@@ -57,7 +71,12 @@ Query syntax:
   doci search "word1 OR word2"       OR (either matches)
   doci search "word1 NOT word2"      exclude word2
   doci search '"exact phrase"'       exact phrase match
-  doci search "pref*"                prefix match`,
+  doci search "pref*"                prefix match
+
+CJK/Japanese:
+  Japanese/Chinese/Korean characters are auto-detected.
+  Short CJK queries (< 3 chars) use LIKE fallback for full coverage.
+  Longer CJK queries use trigram + unicode61 hybrid search.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		query := args[0]
@@ -92,7 +111,29 @@ Query syntax:
 		}
 
 		if hasCJK {
-			// Hybrid: UNION both FTS tables for maximum CJK recall
+			// Check if query has short CJK tokens (< 3 chars) that need LIKE fallback
+			needLike := cjkRuneCount(query) < 3
+
+			var likeClause string
+			if needLike {
+				if searchContext {
+					likeClause = fmt.Sprintf(`
+						UNION ALL
+						SELECT f.path, f.title, f.tags, 0 AS rank, s.content AS snip
+						FROM snippets s
+						JOIN files f ON f.id = s.file_id %s
+						WHERE s.content LIKE ?`, tagJoin)
+				} else {
+					likeClause = fmt.Sprintf(`
+						UNION ALL
+						SELECT f.path, f.title, f.tags, 0 AS rank, '' AS snip
+						FROM snippets s
+						JOIN files f ON f.id = s.file_id %s
+						WHERE s.content LIKE ?`, tagJoin)
+				}
+			}
+
+			// Hybrid: UNION FTS tables + optional LIKE
 			if searchContext {
 				sqlQuery = fmt.Sprintf(`
 					SELECT f.path, f.title, f.tags, rank, s.content AS snip FROM snippets_fts
@@ -103,8 +144,8 @@ Query syntax:
 					SELECT f.path, f.title, f.tags, rank, s.content AS snip FROM snippets_fts_trigram
 					JOIN snippets s ON s.id = snippets_fts_trigram.rowid
 					JOIN files f ON f.id = s.file_id %s
-					WHERE snippets_fts_trigram MATCH ?
-					ORDER BY rank LIMIT ?`, tagJoin, tagJoin)
+					WHERE snippets_fts_trigram MATCH ?%s
+					ORDER BY rank LIMIT ?`, tagJoin, tagJoin, likeClause)
 			} else {
 				sqlQuery = fmt.Sprintf(`
 					SELECT f.path, f.title, f.tags, rank,
@@ -117,13 +158,17 @@ Query syntax:
 						snippet(snippets_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snip FROM snippets_fts_trigram
 					JOIN snippets s ON s.id = snippets_fts_trigram.rowid
 					JOIN files f ON f.id = s.file_id %s
-					WHERE snippets_fts_trigram MATCH ?
-					ORDER BY rank LIMIT ?`, tagJoin, tagJoin)
+					WHERE snippets_fts_trigram MATCH ?%s
+					ORDER BY rank LIMIT ?`, tagJoin, tagJoin, likeClause)
 			}
 			sqlArgs = append(sqlArgs, tagArgs...)
 			sqlArgs = append(sqlArgs, query)
 			sqlArgs = append(sqlArgs, tagArgs...)
 			sqlArgs = append(sqlArgs, query)
+			if needLike {
+				sqlArgs = append(sqlArgs, tagArgs...)
+				sqlArgs = append(sqlArgs, "%"+query+"%")
+			}
 			sqlArgs = append(sqlArgs, searchLimit*3)
 		} else {
 			// ASCII-only: use unicode61 (word-level, faster)
@@ -157,10 +202,14 @@ Query syntax:
 			var rank float64
 			rows.Scan(&path, &title, &tags, &rank, &snip)
 
-			if seen[path] {
-				continue
+			// --context: allow multiple chunks from same file
+			// other modes: dedup by file
+			if !searchContext {
+				if seen[path] {
+					continue
+				}
+				seen[path] = true
 			}
-			seen[path] = true
 
 			r := SearchResult{
 				Path:  path,
@@ -191,7 +240,7 @@ Query syntax:
 
 		// Output
 		if searchJSON {
-			return outputJSON(results, elapsed)
+			return outputJSON(query, results, elapsed)
 		}
 		if searchPathsOnly {
 			return outputPaths(results, home)
@@ -200,13 +249,14 @@ Query syntax:
 	},
 }
 
-func outputJSON(results []SearchResult, elapsed time.Duration) error {
+func outputJSON(query string, results []SearchResult, elapsed time.Duration) error {
 	wrapper := struct {
 		Query   string         `json:"query"`
 		Count   int            `json:"count"`
 		TimeMs  float64        `json:"time_ms"`
 		Results []SearchResult `json:"results"`
 	}{
+		Query:   query,
 		Count:   len(results),
 		TimeMs:  float64(elapsed.Microseconds()) / 1000.0,
 		Results: results,

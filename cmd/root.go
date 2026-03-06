@@ -15,10 +15,11 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "doci",
 	Short: "AI-Native Document Indexer",
-	Long: `doci — ドキュメントを SQLite にインデックスし、AIエージェントが高速検索できるCLI。
+	Long: `doci — ドキュメントを SQLite にインデックスし、FTS5 で高速検索できるCLI。
 
-FTS5（キーワード検索）+ Embedding（セマンティック検索）のハイブリッドで、
-「何を読むべきか」の判断を 2ms 以下に短縮します。`,
+日本語/CJK対応のハイブリッドトークナイザ (unicode61 + trigram) で、
+キーワード検索を 2ms 以下で実行します。
+AI エージェントとの連携向けに --json / --context / --paths-only を提供。`,
 }
 
 func Execute() {
