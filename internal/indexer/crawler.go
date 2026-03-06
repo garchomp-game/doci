@@ -26,6 +26,7 @@ type Config struct {
 	Reset        bool
 	Incremental  bool
 	ChunkLines   int
+	MaxFileSize  int64
 	Verbose      bool
 }
 
@@ -38,7 +39,8 @@ type FileMeta struct {
 	Modified float64
 	Lang     string
 	Title    string
-	Tags     string // JSON array
+	Tags     string   // JSON array
+	TagsList []string // parsed tags for file_tags table
 }
 
 // Result holds indexing statistics.
@@ -50,7 +52,7 @@ type Result struct {
 	DBSize     int64
 }
 
-const maxFileSize = 512 * 1024 // 512KB
+const defaultMaxFileSize int64 = 512 * 1024 // 512KB
 
 var textExtensions = map[string]bool{
 	".md": true, ".mdx": true, ".txt": true, ".rst": true,
@@ -90,6 +92,9 @@ func Run(cfg Config, dbPath string) (*Result, error) {
 
 	if cfg.ChunkLines == 0 {
 		cfg.ChunkLines = DefaultChunkLines
+	}
+	if cfg.MaxFileSize == 0 {
+		cfg.MaxFileSize = defaultMaxFileSize
 	}
 
 	cores := runtime.NumCPU()
@@ -201,13 +206,15 @@ func crawl(cfg Config) ([]FileMeta, error) {
 		// Parse frontmatter for md/mdx
 		var title string
 		var tags string
+		var tagsList []string
 		if ext == ".md" || ext == ".mdx" {
 			if data, err := os.ReadFile(path); err == nil {
-				fm, _ := ParseFrontmatter(string(data))
-				if fm != nil {
-					title = fm.Title
-					if len(fm.Tags) > 0 {
-						if b, err := json.Marshal(fm.Tags); err == nil {
+				parsed, _ := ParseFrontmatter(string(data))
+				if parsed != nil {
+					title = parsed.Title
+					tagsList = parsed.Tags
+					if len(parsed.Tags) > 0 {
+						if b, err := json.Marshal(parsed.Tags); err == nil {
 							tags = string(b)
 						}
 					}
@@ -215,7 +222,7 @@ func crawl(cfg Config) ([]FileMeta, error) {
 			}
 		}
 
-		fm := FileMeta{
+		fileMeta := FileMeta{
 			Path:     path,
 			Name:     name,
 			Ext:      ext,
@@ -224,10 +231,11 @@ func crawl(cfg Config) ([]FileMeta, error) {
 			Lang:     langMap[ext],
 			Title:    title,
 			Tags:     tags,
+			TagsList: tagsList,
 		}
 
 		mu.Lock()
-		files = append(files, fm)
+		files = append(files, fileMeta)
 		mu.Unlock()
 		return nil
 	})
@@ -242,6 +250,10 @@ func insertFiles(db *store.DB, files []FileMeta) error {
 	}
 	stmt, err := tx.Prepare(`INSERT INTO files (path, filename, extension, size_bytes, modified, lang, title, tags, indexed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	tagStmt, err := tx.Prepare(`INSERT OR IGNORE INTO file_tags (file_id, tag) VALUES (?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -261,22 +273,33 @@ func insertFiles(db *store.DB, files []FileMeta) error {
 		if f.Tags != "" {
 			tagsPtr = &f.Tags
 		}
-		stmt.Exec(f.Path, f.Name, extPtr, f.Size, f.Modified, langPtr, titlePtr, tagsPtr, now)
+		result, _ := stmt.Exec(f.Path, f.Name, extPtr, f.Size, f.Modified, langPtr, titlePtr, tagsPtr, now)
+
+		// Insert normalized tags
+		if len(f.TagsList) > 0 {
+			fileID, _ := result.LastInsertId()
+			for _, tag := range f.TagsList {
+				tagStmt.Exec(fileID, tag)
+			}
+		}
 
 		if (i+1)%10000 == 0 {
 			tx.Commit()
 			tx, _ = db.Begin()
 			stmt.Close()
+			tagStmt.Close()
 			stmt, _ = tx.Prepare(`INSERT INTO files (path, filename, extension, size_bytes, modified, lang, title, tags, indexed_at)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			tagStmt, _ = tx.Prepare(`INSERT OR IGNORE INTO file_tags (file_id, tag) VALUES (?, ?)`)
 		}
 	}
 	stmt.Close()
+	tagStmt.Close()
 	return tx.Commit()
 }
 
 func processChunks(db *store.DB, numWorkers, chunkLines int) (int64, int64) {
-	rows, err := db.Query(`SELECT id, path, size_bytes FROM files WHERE size_bytes > 0 AND size_bytes <= ? ORDER BY size_bytes ASC`, maxFileSize)
+	rows, err := db.Query(`SELECT id, path, size_bytes FROM files WHERE size_bytes > 0 AND size_bytes <= ? ORDER BY size_bytes ASC`, defaultMaxFileSize)
 	if err != nil {
 		return 0, 0
 	}

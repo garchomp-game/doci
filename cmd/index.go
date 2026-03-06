@@ -14,6 +14,7 @@ var (
 	reset        bool
 	incremental  bool
 	excludes     []string
+	maxFileSize  int64
 )
 
 var indexCmd = &cobra.Command{
@@ -49,6 +50,7 @@ var indexCmd = &cobra.Command{
 			Exclude:      excludes,
 			Reset:        reset,
 			Incremental:  incremental,
+			MaxFileSize:  maxFileSize,
 			Verbose:      verbose,
 		}
 
@@ -75,9 +77,10 @@ var indexCmd = &cobra.Command{
 }
 
 func init() {
-	indexCmd.Flags().BoolVar(&useGitIgnore, "use-gitignore", false, ".gitignore を尊重")
-	indexCmd.Flags().BoolVar(&reset, "reset", false, "DB削除して再構築")
-	indexCmd.Flags().BoolVar(&incremental, "incremental", false, "差分のみ再インデックス")
-	indexCmd.Flags().StringSliceVar(&excludes, "exclude", nil, "追加除外パターン")
+	indexCmd.Flags().BoolVar(&useGitIgnore, "use-gitignore", false, "respect .gitignore")
+	indexCmd.Flags().BoolVar(&reset, "reset", false, "drop and rebuild DB")
+	indexCmd.Flags().BoolVar(&incremental, "incremental", false, "incremental reindex")
+	indexCmd.Flags().StringSliceVar(&excludes, "exclude", nil, "additional exclude patterns")
+	indexCmd.Flags().Int64Var(&maxFileSize, "max-file-size", 0, "max file size in bytes (default 512KB)")
 	rootCmd.AddCommand(indexCmd)
 }
