@@ -7,11 +7,25 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/garchomp-game/doci/internal/output"
 	"github.com/garchomp-game/doci/internal/store"
 	"github.com/spf13/cobra"
 )
+
+// containsCJK returns true if the string contains CJK/Japanese characters.
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) ||
+			unicode.Is(unicode.Hiragana, r) ||
+			unicode.Is(unicode.Katakana, r) ||
+			unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	searchTag       []string
@@ -57,40 +71,76 @@ Query syntax:
 		start := time.Now()
 		home, _ := os.UserHomeDir()
 
+		hasCJK := containsCJK(query)
+
 		// Build SQL
 		var sqlQuery string
 		var sqlArgs []interface{}
 
-		selectCols := `f.path, f.title, f.tags, rank,
-			snippet(snippets_fts, 0, '>>>', '<<<', '...', 40) AS snip`
-
-		if searchContext {
-			// --context: return full chunk content, not snippet
-			selectCols = `f.path, f.title, f.tags, rank, s.content AS snip`
-		}
-
-		baseQuery := fmt.Sprintf(`
-			SELECT %s
-			FROM snippets_fts
-			JOIN snippets s ON s.id = snippets_fts.rowid
-			JOIN files f ON f.id = s.file_id`, selectCols)
-
+		// Tag filter sub-join (used in both branches)
+		tagJoin := ""
+		var tagArgs []interface{}
 		if len(searchTag) > 0 {
-			// Use file_tags table for normalized tag filtering
 			tagPlaceholders := make([]string, len(searchTag))
 			for i, tag := range searchTag {
 				tagPlaceholders[i] = "?"
-				sqlArgs = append(sqlArgs, tag)
+				tagArgs = append(tagArgs, tag)
 			}
-			baseQuery += fmt.Sprintf(`
+			tagJoin = fmt.Sprintf(`
 				JOIN file_tags ft ON ft.file_id = f.id
 				AND ft.tag IN (%s)`, strings.Join(tagPlaceholders, ","))
 		}
 
-		sqlQuery = baseQuery + `
-			WHERE snippets_fts MATCH ?
-			ORDER BY rank LIMIT ?`
-		sqlArgs = append(sqlArgs, query, searchLimit*3) // fetch more for dedup
+		if hasCJK {
+			// Hybrid: UNION both FTS tables for maximum CJK recall
+			if searchContext {
+				sqlQuery = fmt.Sprintf(`
+					SELECT f.path, f.title, f.tags, rank, s.content AS snip FROM snippets_fts
+					JOIN snippets s ON s.id = snippets_fts.rowid
+					JOIN files f ON f.id = s.file_id %s
+					WHERE snippets_fts MATCH ?
+					UNION ALL
+					SELECT f.path, f.title, f.tags, rank, s.content AS snip FROM snippets_fts_trigram
+					JOIN snippets s ON s.id = snippets_fts_trigram.rowid
+					JOIN files f ON f.id = s.file_id %s
+					WHERE snippets_fts_trigram MATCH ?
+					ORDER BY rank LIMIT ?`, tagJoin, tagJoin)
+			} else {
+				sqlQuery = fmt.Sprintf(`
+					SELECT f.path, f.title, f.tags, rank,
+						snippet(snippets_fts, 0, '>>>', '<<<', '...', 40) AS snip FROM snippets_fts
+					JOIN snippets s ON s.id = snippets_fts.rowid
+					JOIN files f ON f.id = s.file_id %s
+					WHERE snippets_fts MATCH ?
+					UNION ALL
+					SELECT f.path, f.title, f.tags, rank,
+						snippet(snippets_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snip FROM snippets_fts_trigram
+					JOIN snippets s ON s.id = snippets_fts_trigram.rowid
+					JOIN files f ON f.id = s.file_id %s
+					WHERE snippets_fts_trigram MATCH ?
+					ORDER BY rank LIMIT ?`, tagJoin, tagJoin)
+			}
+			sqlArgs = append(sqlArgs, tagArgs...)
+			sqlArgs = append(sqlArgs, query)
+			sqlArgs = append(sqlArgs, tagArgs...)
+			sqlArgs = append(sqlArgs, query)
+			sqlArgs = append(sqlArgs, searchLimit*3)
+		} else {
+			// ASCII-only: use unicode61 (word-level, faster)
+			selectCols := `f.path, f.title, f.tags, rank,
+				snippet(snippets_fts, 0, '>>>', '<<<', '...', 40) AS snip`
+			if searchContext {
+				selectCols = `f.path, f.title, f.tags, rank, s.content AS snip`
+			}
+			sqlQuery = fmt.Sprintf(`
+				SELECT %s FROM snippets_fts
+				JOIN snippets s ON s.id = snippets_fts.rowid
+				JOIN files f ON f.id = s.file_id %s
+				WHERE snippets_fts MATCH ?
+				ORDER BY rank LIMIT ?`, selectCols, tagJoin)
+			sqlArgs = append(sqlArgs, tagArgs...)
+			sqlArgs = append(sqlArgs, query, searchLimit*3)
+		}
 
 		rows, err := db.Query(sqlQuery, sqlArgs...)
 		if err != nil {

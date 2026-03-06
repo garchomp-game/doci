@@ -64,13 +64,15 @@ func (d *DB) CreateIndexes() error {
 	return nil
 }
 
-// CreateFTS builds the FTS5 full-text search index with unicode61 tokenizer.
-// unicode61 handles CJK characters better than the default ASCII tokenizer.
-// remove_diacritics=2 removes all diacritical marks for broader matching.
+// CreateFTS builds dual FTS5 indexes for hybrid word + character search.
+// - snippets_fts: unicode61 tokenizer (word-level, good for English)
+// - snippets_fts_trigram: trigram tokenizer (character-level, good for CJK/Japanese)
 func (d *DB) CreateFTS() error {
-	// Drop old FTS table to ensure tokenizer change takes effect
+	// Drop old tables
 	d.Exec(`DROP TABLE IF EXISTS snippets_fts`)
+	d.Exec(`DROP TABLE IF EXISTS snippets_fts_trigram`)
 
+	// Word-level FTS (unicode61)
 	if _, err := d.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS snippets_fts USING fts5(
 		content,
 		content=snippets,
@@ -79,6 +81,19 @@ func (d *DB) CreateFTS() error {
 	)`); err != nil {
 		return err
 	}
-	_, err := d.Exec(`INSERT INTO snippets_fts(snippets_fts) VALUES('rebuild')`)
+	if _, err := d.Exec(`INSERT INTO snippets_fts(snippets_fts) VALUES('rebuild')`); err != nil {
+		return err
+	}
+
+	// Character-level FTS (trigram) — essential for Japanese/CJK
+	if _, err := d.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS snippets_fts_trigram USING fts5(
+		content,
+		content=snippets,
+		content_rowid=id,
+		tokenize='trigram'
+	)`); err != nil {
+		return err
+	}
+	_, err := d.Exec(`INSERT INTO snippets_fts_trigram(snippets_fts_trigram) VALUES('rebuild')`)
 	return err
 }
