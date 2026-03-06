@@ -111,25 +111,41 @@ CJK/Japanese:
 		}
 
 		if hasCJK {
-			// Check if query has short CJK tokens (< 3 chars) that need LIKE fallback
-			needLike := cjkRuneCount(query) < 3
+			// Split query into tokens for multi-keyword LIKE AND
+			tokens := strings.Fields(query)
+			needLike := false
+			for _, t := range tokens {
+				if containsCJK(t) && cjkRuneCount(t) < 3 {
+					needLike = true
+					break
+				}
+			}
 
 			var likeClause string
+			var likeArgs []interface{}
 			if needLike {
+				// Build LIKE conditions: s.content LIKE '%tok1%' AND s.content LIKE '%tok2%'
+				var likeConds []string
+				for _, t := range tokens {
+					likeConds = append(likeConds, "s.content LIKE ?")
+					likeArgs = append(likeArgs, "%"+t+"%")
+				}
+				likeWhere := strings.Join(likeConds, " AND ")
+
 				if searchContext {
 					likeClause = fmt.Sprintf(`
 						UNION ALL
-						SELECT f.path, f.title, f.tags, 0 AS rank, s.content AS snip
+						SELECT f.path, f.title, f.tags, -0.01 AS rank, s.content AS snip
 						FROM snippets s
 						JOIN files f ON f.id = s.file_id %s
-						WHERE s.content LIKE ?`, tagJoin)
+						WHERE %s`, tagJoin, likeWhere)
 				} else {
 					likeClause = fmt.Sprintf(`
 						UNION ALL
-						SELECT f.path, f.title, f.tags, 0 AS rank, '' AS snip
+						SELECT f.path, f.title, f.tags, -0.01 AS rank, '' AS snip
 						FROM snippets s
 						JOIN files f ON f.id = s.file_id %s
-						WHERE s.content LIKE ?`, tagJoin)
+						WHERE %s`, tagJoin, likeWhere)
 				}
 			}
 
@@ -167,7 +183,9 @@ CJK/Japanese:
 			sqlArgs = append(sqlArgs, query)
 			if needLike {
 				sqlArgs = append(sqlArgs, tagArgs...)
-				sqlArgs = append(sqlArgs, "%"+query+"%")
+				for _, a := range likeArgs {
+					sqlArgs = append(sqlArgs, a)
+				}
 			}
 			sqlArgs = append(sqlArgs, searchLimit*3)
 		} else {
